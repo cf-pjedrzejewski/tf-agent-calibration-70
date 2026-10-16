@@ -3,6 +3,7 @@ name: Terraform test agent
 on:
   pull_request:
     paths:
+      - "modules/**/*.md"
       - "modules/**/*.tf"
       - "modules/**/*.tftest.hcl"
       - ".github/agents/**"
@@ -14,18 +15,74 @@ permissions:
 
 jobs:
   test-agent:
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: git diff "$BASE_SHA...$HEAD_SHA" -- modules stacks > /tmp/terraform-changes.diff
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: ${{ vars.TERRAFORM_VERSION || '1.9.8' }}
+          terraform_version: '1.9.8'
       - uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          claude_args: >-
+            --model claude-haiku-4-5-20251001
+            --max-turns 30
+            --allowedTools "Read,Glob,Grep,Edit,Write,Bash(terraform *)"
           prompt: >-
             Read .github/agents/terraform-test-agent.md and the skill it names.
-            Inspect the pull request diff, update tests for changed Terraform
+            Read /tmp/terraform-changes.diff, update tests for changed Terraform
             modules when appropriate, and run terraform test for those modules.
+            Write report.md with decisions, test results, unresolved failures,
+            findings, and the full proposed contents of every changed test file
+            in fenced HCL blocks. The separate reporting job publishes it as a
+            PR comment for a maintainer to copy; do not push or create a PR.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: terraform-report
+          path: report.md
+          if-no-files-found: error
+
+  report:
+    needs: test-agent
+    if: always() && needs.test-agent.result != 'skipped'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v4
+        id: download
+        continue-on-error: true
+        with:
+          name: terraform-report
+          path: report
+      - uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          AGENT_RESULT: ${{ needs.test-agent.result }}
+        with:
+          script: |
+            const fs = require('fs');
+            const result = process.env.AGENT_RESULT;
+            const path = 'report/report.md';
+            const detail = fs.existsSync(path)
+              ? fs.readFileSync(path, 'utf8').slice(0, 50000)
+              : 'No report was produced. Check the failed agent job logs.';
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: Number(process.env.PR_NUMBER),
+              body: `Terraform agent job: ${result}\n\n${detail}`
+            });
